@@ -64,6 +64,7 @@ class TaskSystemParallelThreadPoolSpinning: public ITaskSystem {
         std::atomic<int> next_task_;
         std::atomic<bool> shutdown_;
         std::atomic<int> num_total_tasks_;
+        std::atomic<int> tasks_completed_;
         IRunnable* runnable_;
 };
 
@@ -87,6 +88,7 @@ class TaskSystemParallelThreadPoolSleeping: public ITaskSystem {
         std::vector<std::thread> threads_;
 
         std::atomic<int> next_task_;
+        std::atomic<bool> work_available_;
         std::atomic<bool> shutdown_;
         std::atomic<int> num_total_tasks_;
         IRunnable* runnable_;

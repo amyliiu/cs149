@@ -136,19 +136,31 @@ TaskSystemParallelThreadPoolSpinning::TaskSystemParallelThreadPoolSpinning(int n
     shutdown_ = false;
     next_task_ = 0;
     num_total_tasks_ = 0;
+    tasks_completed_ = 0;
     runnable_ = nullptr;
 
     threads_.resize(num_threads_);
     for (int i = 0; i < num_threads_; i++) {
         threads_[i] = std::thread([this]() {
             while (!shutdown_) {
-                if (runnable_ != nullptr) {
-                    int task_id = next_task_.fetch_add(1);
-                    runnable_->runTask(task_id, num_total_tasks_);
-                    if (task_id >= num_total_tasks_) {
-                        shutdown_ = true;
+                // Try to grab a task first (before checking runnable)
+                int task_id = next_task_.load();
+                
+                // Check if there might be work
+                if (task_id < num_total_tasks_.load() && runnable_ != nullptr) {
+                    // Atomically grab the task
+                    task_id = next_task_.fetch_add(1);
+                    
+                    // Double-check task is valid and we have a runnable
+                    if (task_id < num_total_tasks_.load()) {
+                        IRunnable* local_runnable = runnable_;  // Cache locally
+                        if (local_runnable != nullptr) {
+                            local_runnable->runTask(task_id, num_total_tasks_.load());
+                            tasks_completed_.fetch_add(1);
+                        }
                     }
                 }
+                // Keep spinning (checking for work)
             }
         });
     }
@@ -168,11 +180,16 @@ void TaskSystemParallelThreadPoolSpinning::run(IRunnable* runnable, int num_tota
     // tasks sequentially on the calling thread.
     //
     next_task_ = 0;
+    tasks_completed_ = 0;
     num_total_tasks_ = num_total_tasks;
     runnable_ = runnable;
     
-    while (next_task_ < num_total_tasks_) {
+    // Spin wait until all tasks are completed
+    while (tasks_completed_.load() < num_total_tasks) {
+        // Busy wait (spinning)
     }
+    
+    // Clear runnable pointer
     runnable_ = nullptr;
 }
 
@@ -209,27 +226,45 @@ TaskSystemParallelThreadPoolSleeping::TaskSystemParallelThreadPoolSleeping(int n
     next_task_ = 0;
     num_total_tasks_ = 0;
     runnable_ = nullptr;
+    tasks_completed_ = 0;
+    work_available_ = false;
 
     threads_.resize(num_threads_);
     for (int i = 0; i < num_threads_; i++) {
         threads_[i] = std::thread([this]() {
-            while (!shutdown_) {
+            while (true) {
+                int task_id;
+                int total_tasks;
                 {
-                    int task_id;
-                    {
-                        std::unique_lock<std::mutex> lock(mutex_);
-                        cv_work_.wait(lock, [this]() { return runnable_ != nullptr || shutdown_; });
-                        if (shutdown_) {
-                            return;
-                        }
-                        task_id = next_task_.fetch_add(1);
-                        if (task_id >= num_total_tasks_) {
-                            shutdown_ = true;
-                        }
+                    std::unique_lock<std::mutex> lock(mutex_);
+                    // Wait for work
+                    cv_work_.wait(lock, [this]() { 
+                        return work_available_ || shutdown_; 
+                    });
+                    
+                    if (shutdown_) {
+                        return;  // Exit thread
                     }
-                    runnable_->runTask(task_id, num_total_tasks_);
-                    if (tasks_completed_.fetch_add(1)+1 >= num_total_tasks_) {
-                        std::lock_guard<std::mutex> lock(mutex_);
+                    
+                    // Grab a task
+                    task_id = next_task_.fetch_add(1);
+                    total_tasks = num_total_tasks_.load();
+                    
+                    // If no more tasks left to grab, mark work as unavailable
+                    if (next_task_.load() >= total_tasks) {
+                        work_available_ = false;
+                    }
+                }
+                
+                // Execute task if valid
+                if (task_id < total_tasks) {
+                    runnable_->runTask(task_id, total_tasks);
+                    
+                    // Increment completed counter
+                    int completed = tasks_completed_.fetch_add(1) + 1;
+                    
+                    // If all tasks done, notify main thread
+                    if (completed >= total_tasks) {
                         cv_done_.notify_one();
                     }
                 }
@@ -250,6 +285,12 @@ TaskSystemParallelThreadPoolSleeping::~TaskSystemParallelThreadPoolSleeping() {
         std::lock_guard<std::mutex> lock(mutex_);
         shutdown_ = true;
     }
+    cv_work_.notify_all();  // Wake up all threads so they can exit
+
+    // Wait for all threads to complete
+    for (auto& thread : threads_) {
+        thread.join();
+    }
 }
 
 void TaskSystemParallelThreadPoolSleeping::run(IRunnable* runnable, int num_total_tasks) {
@@ -262,13 +303,14 @@ void TaskSystemParallelThreadPoolSleeping::run(IRunnable* runnable, int num_tota
     //
 
     {
-        std::lock_guard<std::mutex> lock(mutex_);
+        std::unique_lock<std::mutex> lock(mutex_);
         runnable_ = runnable;
         num_total_tasks_ = num_total_tasks;
         tasks_completed_ = 0;
         next_task_ = 0;
+        work_available_ = true;  // Mark work as available
+        cv_work_.notify_all();  // Notify while holding lock!
     }
-    cv_work_.notify_all();
 
     // wait for completion
     std::unique_lock<std::mutex> lock(mutex_);
